@@ -1,0 +1,1197 @@
+./util/ResetPasswordStorage.java
+package com.challenge.drive.util;
+
+import com.challenge.drive.model.UserModel;
+
+import java.util.ArrayList;
+import java.util.UUID;
+
+public class ResetPasswordStorage {
+
+    private static ResetPasswordStorage instance;
+    private final ArrayList<ResetPasswordToken> resetPasswordTokens;
+
+    private ResetPasswordStorage() {
+        this.resetPasswordTokens = new ArrayList<>();
+    }
+
+    public static synchronized ResetPasswordStorage getInstance() {
+        if (instance == null) {
+            instance = new ResetPasswordStorage();
+        }
+        return instance;
+    }
+
+    private String createUniqueToken(UserModel user) {
+        return UUID.randomUUID() + "|" + user.getId();
+    }
+
+    public ResetPasswordToken createResetPasswordToken(UserModel user) {
+        ResetPasswordToken resetPasswordToken = new ResetPasswordToken(createUniqueToken(user), user.getEmail());
+        resetPasswordTokens.add(resetPasswordToken);
+        return resetPasswordToken;
+    }
+
+    public int getUserFromResetPasswordToken(String email, String uniqueToken) {
+        ResetPasswordToken resetPasswordToken = new ResetPasswordToken(uniqueToken, email);
+        if (resetPasswordTokens.contains(resetPasswordToken)) {
+            return Integer.parseInt(uniqueToken.split("\\|")[1]);
+        }
+        return -1;
+    }
+
+}
+./util/ResetPasswordToken.java
+package com.challenge.drive.util;
+
+public class ResetPasswordToken {
+
+    private String token;
+    private String email;
+
+    public ResetPasswordToken(String token, String email) {
+        this.token = token;
+        this.email = email;
+    }
+
+    public String getToken() {
+        return token;
+    }
+
+    public void setToken(String token) {
+        this.token = token;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    public void setEmail(String email) {
+        this.email = email;
+    }
+
+    @Override
+    public String toString() {
+        return "ResetPasswordToken [token=" + token + ", email=" + email + "]";
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return this.token.split("\\|")[0].equals(((ResetPasswordToken) o).token.split("\\|")[0]) && this.hashCode() == o.hashCode();
+    }
+
+    @Override
+    public int hashCode() {
+        return token.hashCode() + email.hashCode();
+    }
+}
+./util/CryptoUtils.java
+package com.challenge.drive.util;
+
+import java.security.SecureRandom;
+
+public class CryptoUtils {
+
+    private static final SecureRandom secureRandom = new SecureRandom();
+    private static final String HEX_CHARACTERS = "0123456789abcdef";
+
+    public static String generateRandomHex() {
+        StringBuilder sb = new StringBuilder(32);
+        for (int i = 0; i < 32; i++) {
+            int index = secureRandom.nextInt(HEX_CHARACTERS.length());
+            sb.append(HEX_CHARACTERS.charAt(index));
+        }
+        return sb.toString();
+    }
+}
+./repository/UserRepository.java
+package com.challenge.drive.repository;
+
+import com.challenge.drive.model.UserModel;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface UserRepository extends JpaRepository<UserModel, Integer> {
+    UserModel findById(int id);
+
+    UserModel findByUsername(String username);
+
+    UserModel findByEmail(String email);
+
+    UserModel findByUsernameAndPassword(String username, String password);
+}./repository/FileRepository.java
+package com.challenge.drive.repository;
+
+import com.challenge.drive.model.FileModel;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.List;
+
+public interface FileRepository extends JpaRepository<FileModel, Integer> {
+    FileModel findById(int fileId);
+
+    List<FileModel> findByUserId(int userId);
+}./service/FileService.java
+package com.challenge.drive.service;
+
+import com.challenge.drive.model.FileModel;
+import com.challenge.drive.repository.FileRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+public class FileService {
+
+    @Autowired
+    private FileRepository fileRepository;
+
+    public FileModel findById(int fileId) {
+        return fileRepository.findById(fileId);
+    }
+
+    public List<FileModel> findByUserId(int userId) {
+        return fileRepository.findByUserId(userId);
+    }
+
+    public void delete(FileModel fileModel) {
+        fileRepository.delete(fileModel);
+    }
+
+    public void saveFile(FileModel fileModel) {
+        ClamAVService.getInstance().addToScan(fileModel.getFilePath());
+        fileRepository.save(fileModel);
+    }
+
+}
+./service/ClamAVService.java
+package com.challenge.drive.service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import redis.clients.jedis.Jedis;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+
+@Service
+public class ClamAVService {
+
+    private static final Logger logger = LoggerFactory.getLogger(ClamAVService.class);
+
+    private static final String QUEUE_KEY = "clamav_queue";
+
+    private static volatile ClamAVService instance;
+    private final Jedis jedis;
+
+    public ClamAVService() {
+        this.jedis = new Jedis("localhost", 6379);
+    }
+
+    public static ClamAVService getInstance() {
+        if (instance == null) {
+            synchronized (ClamAVService.class) {
+                if (instance == null) {
+                    instance = new ClamAVService();
+                }
+            }
+        }
+        return instance;
+    }
+
+    public void addToScan(String filePath) {
+        jedis.rpush(QUEUE_KEY, filePath);
+    }
+
+    public String dequeue() {
+        return jedis.lpop(QUEUE_KEY);
+    }
+
+    public boolean isEmpty() {
+        return jedis.llen(QUEUE_KEY) == 0;
+    }
+
+    @Scheduled(fixedRate = 60 * 1000)
+    public void scanAllFiles() {
+        logger.info("Scanning all files...");
+        while (!this.isEmpty()) {
+            String filePath = this.dequeue();
+            logger.info("Scanning file {}...", filePath);
+            if (!this.isFileClean(filePath)) {
+                try {
+                    Files.deleteIfExists(Paths.get(filePath));
+                } catch (IOException ignored) {
+                    logger.error("Unable to delete the file {}", filePath);
+                }
+            }
+        }
+    }
+
+    public boolean isFileClean(String filePath) {
+        String command = String.format("clamscan --quiet '%s'", filePath);
+        ProcessBuilder processBuilder = new ProcessBuilder("/bin/sh", "-c", command);
+
+        try {
+            Process process = processBuilder.start();
+            return process.waitFor() == 0;
+        } catch (Exception ignored) {
+            logger.error("Unable to scan the file {}", filePath);
+        }
+        return false;
+    }
+
+}
+./service/UserService.java
+package com.challenge.drive.service;
+
+import com.challenge.drive.model.UserModel;
+import com.challenge.drive.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+@Service
+public class UserService {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    public UserModel findUserById(int id) {
+        return userRepository.findById(id);
+    }
+
+    public UserModel findByUsername(String username) {
+        return userRepository.findByUsername(username);
+    }
+
+    public UserModel findByEmail(String email) {
+        return userRepository.findByEmail(email);
+    }
+
+    public UserModel findByUsernameAndPassword(String username, String password) {
+        return userRepository.findByUsernameAndPassword(username, password);
+    }
+
+    public UserModel saveUser(UserModel user) {
+        return userRepository.save(user);
+    }
+
+}
+./all_source_code.txt
+./DriveApplication.java
+package com.challenge.drive;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.web.bind.annotation.RestController;
+
+
+@SpringBootApplication
+@EnableScheduling
+@RestController
+public class DriveApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(DriveApplication.class, args);
+    }
+
+}./model/UserModel.java
+package com.challenge.drive.model;
+
+import jakarta.persistence.*;
+import org.springframework.data.annotation.CreatedDate;
+
+import java.time.Instant;
+
+@Entity
+@Table(name = "users")
+public class UserModel {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private String username;
+    private String password;
+    private String email;
+    private String session;
+    @CreatedDate
+    private Instant creationDate = Instant.now();
+
+    public int getId() {
+        return id;
+    }
+
+    public void setId(int id) {
+        this.id = id;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
+    public void setPassword(String password) {
+        this.password = password;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    public void setEmail(String email) {
+        this.email = email;
+    }
+
+    public String getSession() {
+        return session;
+    }
+
+    public void setSession(String session) {
+        this.session = session;
+    }
+
+
+    public Instant getCreationDate() {
+        return creationDate;
+    }
+
+    public void setCreationDate(Instant creationDate) {
+        this.creationDate = creationDate;
+    }
+}
+./model/FileModel.java
+package com.challenge.drive.model;
+
+import jakarta.persistence.*;
+import org.springframework.data.annotation.CreatedDate;
+
+import java.time.Instant;
+
+@Entity
+@Table(name = "files")
+public class FileModel {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private String filename;
+    private String filePath;
+    private int fileSize;
+
+    @CreatedDate
+    private Instant creationDate = Instant.now();
+    private int userId;
+
+    public int getId() {
+        return id;
+    }
+
+    public void setId(int id) {
+        this.id = id;
+    }
+
+    public String getFilename() {
+        return filename;
+    }
+
+    public void setFilename(String filename) {
+        this.filename = filename;
+    }
+
+    public String getFilePath() {
+        return filePath;
+    }
+
+    public void setFilePath(String filePath) {
+        this.filePath = filePath;
+    }
+
+    public Instant getCreationDate() {
+        return creationDate;
+    }
+
+    public void setCreationDate(Instant creationDate) {
+        this.creationDate = creationDate;
+    }
+
+    public int getUserId() {
+        return userId;
+    }
+
+    public void setUserId(int userId) {
+        this.userId = userId;
+    }
+
+    public int getFileSize() {
+        return fileSize;
+    }
+
+    public void setFileSize(int fileSize) {
+        this.fileSize = fileSize;
+    }
+}
+./dto/JSendDto.java
+package com.challenge.drive.dto;
+
+public record JSendDto(String status, String message, Object data) {
+
+    public JSendDto(String status, String message, Object data) {
+        this.status = status;
+        this.message = message;
+        this.data = data;
+    }
+
+    public static JSendDto success(Object data) {
+        return new JSendDto("success", null, data);
+    }
+
+    public static JSendDto success(String message) {
+        return new JSendDto("success", message, null);
+    }
+
+    public static JSendDto fail(Object data) {
+        return new JSendDto("fail", null, data);
+    }
+
+    public static JSendDto fail(String message) {
+        return new JSendDto("fail", message, null);
+    }
+
+    public static JSendDto error(Object data) {
+        return new JSendDto("error", null, data);
+    }
+
+    public static JSendDto error(String message) {
+        return new JSendDto("error", message, null);
+    }
+
+}./dto/SendResetPasswordDto.java
+package com.challenge.drive.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record SendResetPasswordDto(
+        @NotBlank(message = "Email is required")
+        @Size(min = 3, max = 64, message = "Email must be between 3 and 64 characters")
+        String email
+) {
+}./dto/RemoteUploadDto.java
+package com.challenge.drive.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+
+public record RemoteUploadDto(
+        @NotBlank(message = "URL is required")
+        @Size(min = 3, max = 2048, message = "URL must be between 3 and 2048 characters")
+        String url,
+
+        @NotNull(message = "Filename is required")
+        @NotBlank(message = "Filename is required")
+        @Size(min = 1, max = 255, message = "Filename must be between 1 and 255 characters")
+        String filename,
+
+        @NotBlank(message = "HTTP method is required")
+        @Size(min = 3, max = 255, message = "HTTP method must be between 3 and 255 characters")
+        String httpMethod
+) {
+    public RemoteUploadDto(String url, String filename) {
+        this(url, filename, "GET");
+    }
+}./dto/ResetPasswordDto.java
+package com.challenge.drive.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record ResetPasswordDto(
+        @NotBlank(message = "Email is required")
+        @Size(min = 3, max = 64, message = "Email must be between 3 and 64 characters")
+        String email,
+
+        @NotBlank(message = "Token is required")
+        String token,
+
+        @NotBlank(message = "Password is required")
+        @Size(min = 4, message = "Password must be at least 4 characters")
+        String password
+) {
+}./dto/RegisterDto.java
+package com.challenge.drive.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record RegisterDto(
+        @NotBlank(message = "Username is required")
+        @Size(min = 3, max = 32, message = "Username must be between 3 and 32 characters")
+        String username,
+
+        @NotBlank(message = "Email is required")
+        @Size(min = 3, max = 64, message = "Email must be between 3 and 64 characters")
+        String email,
+
+        @NotBlank(message = "Password is required")
+        @Size(min = 8, message = "Password must be at least 8 characters")
+        String password,
+
+        @NotBlank(message = "Confirmation password is required")
+        @Size(min = 8, message = "Password must be at least 8 characters")
+        String confirmPassword
+) {
+}./dto/RemoveFileDto.java
+package com.challenge.drive.dto;
+
+import org.hibernate.validator.constraints.Range;
+
+public record RemoveFileDto(
+        @Range(min = 1)
+        int fileId
+) {
+}
+./dto/DownloadFileDto.java
+package com.challenge.drive.dto;
+
+import org.hibernate.validator.constraints.Range;
+
+public record DownloadFileDto(
+        @Range(min = 1)
+        int fileId
+) {
+}
+./dto/UserOutputDto.java
+package com.challenge.drive.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record UserOutputDto(
+        int id,
+        String username,
+        String email
+) {
+        public UserOutputDto(int id, String username, String email) {
+                this.id = id;
+                this.username = username;
+                this.email = email;
+        }
+}./dto/DownloadFileOutputDto.java
+package com.challenge.drive.dto;
+
+public record DownloadFileOutputDto(
+        String base64
+) {
+}
+./dto/LoginDto.java
+package com.challenge.drive.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record LoginDto(
+        @NotBlank(message = "Username is required")
+        @Size(min = 3, max = 32, message = "Username must be between 3 and 32 characters")
+        String username,
+
+        @NotBlank(message = "Password is required")
+        @Size(min = 8, message = "Password must be at least 8 characters")
+        String password
+) {
+}
+./controller/UserController.java
+package com.challenge.drive.controller;
+
+import com.challenge.drive.dto.JSendDto;
+import com.challenge.drive.dto.UserOutputDto;
+import com.challenge.drive.model.UserModel;
+import com.challenge.drive.service.UserService;
+import jakarta.servlet.http.HttpSession;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/user")
+public class UserController {
+
+    @Autowired
+    private UserService userService;
+
+    @GetMapping("/profile")
+    public JSendDto profile(HttpSession session) {
+        int userId = (int) session.getAttribute("userId");
+
+        UserModel user = userService.findUserById(userId);
+        if (user == null) {
+            return JSendDto.fail("User not found");
+        }
+
+        UserOutputDto userOutput = new UserOutputDto(user.getId(), user.getUsername(), user.getEmail());
+        return JSendDto.success(userOutput);
+    }
+
+}
+./controller/FileController.java
+package com.challenge.drive.controller;
+
+import com.challenge.drive.config.Constants;
+import com.challenge.drive.dto.*;
+import com.challenge.drive.model.FileModel;
+import com.challenge.drive.service.FileService;
+import com.challenge.drive.service.UserService;
+import jakarta.servlet.http.HttpSession;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.support.DefaultMessageSourceResolvable;
+import org.springframework.validation.BindingResult;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Base64;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/file")
+public class FileController {
+
+    private static final Logger logger = LoggerFactory.getLogger(FileController.class);
+
+    @Autowired
+    private FileService fileService;
+
+    @Autowired
+    private UserService userService;
+
+    @GetMapping("/")
+    public JSendDto listFiles(HttpSession session) {
+        int userId = (int) session.getAttribute("userId");
+
+        try {
+            List<FileModel> files = fileService.findByUserId(userId);
+            return JSendDto.success(files);
+        } catch (Exception e) {
+            logger.error("An exception occurred while listing files", e);
+            return JSendDto.error("An exception occurred while listing files");
+        }
+    }
+
+    @PostMapping("/download")
+    public JSendDto downloadFile(HttpSession session, @RequestBody DownloadFileDto downloadFileDto, BindingResult bindingResult) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+        int userId = (int) session.getAttribute("userId");
+        int fileId = downloadFileDto.fileId();
+
+        FileModel fileModel = fileService.findById(fileId);
+        if (fileModel == null) {
+            return JSendDto.error("Unable to find the file");
+        }
+
+        if (fileModel.getUserId() != userId) {
+            return JSendDto.error("Unable to access the file");
+        }
+
+        try {
+            Path filePath = Paths.get(fileModel.getFilePath());
+            byte[] fileContent = Files.readAllBytes(filePath);
+            String fileContentBase64 = Base64.getEncoder().encodeToString(fileContent);
+            DownloadFileOutputDto downloadFileOutputDto = new DownloadFileOutputDto(fileContentBase64);
+            return JSendDto.success(downloadFileOutputDto);
+        } catch (Exception e) {
+            logger.error("An exception occurred while downloading the file", e);
+            return JSendDto.error("An exception occurred while downloading the file");
+        }
+    }
+
+    @DeleteMapping("/remove")
+    public JSendDto removeFile(HttpSession session, @RequestBody RemoveFileDto removeFileDto, BindingResult bindingResult) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+        int userId = (int) session.getAttribute("userId");
+        int fileId = removeFileDto.fileId();
+
+        FileModel fileModel = fileService.findById(fileId);
+        if (fileModel == null) {
+            return JSendDto.error("Unable to find the file");
+        }
+
+        if (fileModel.getUserId() != userId) {
+            return JSendDto.error("Unable to access the file");
+        }
+
+        String filePathStr = fileModel.getFilePath();
+        Path filePath = Paths.get(filePathStr);
+        try {
+            Files.deleteIfExists(filePath);
+        } catch (Exception e) {
+            logger.error("An exception occurred while removing the file", e);
+            return JSendDto.error("An exception occurred while removing the file");
+        }
+
+        fileService.delete(fileModel);
+        return JSendDto.success("File successfully removed");
+    }
+
+    @PostMapping("/upload")
+    public JSendDto uploadFile(HttpSession session, @RequestBody MultipartFile file) {
+        if (file.isEmpty()) {
+            return JSendDto.fail("Please select a file to upload");
+        }
+        int userId = (int) session.getAttribute("userId");
+
+        try {
+            Path uploadPath = Paths.get(Constants.UPLOAD_DIR);
+            if (!Files.exists(uploadPath)) {
+                Files.createDirectories(uploadPath);
+            }
+
+            String fileName = UUID.randomUUID().toString();
+            Path filePath = uploadPath.resolve(fileName);
+            Files.write(filePath, file.getBytes());
+
+            FileModel fileModel = new FileModel();
+            fileModel.setFilePath(filePath.toUri().getPath());
+            fileModel.setFileSize((int) file.getSize());
+            fileModel.setFilename(fileName);
+            fileModel.setUserId(userId);
+            fileService.saveFile(fileModel);
+
+            return JSendDto.success("File uploaded successfully");
+        } catch (Exception e) {
+            return JSendDto.error("An error occurred while uploading the file");
+        }
+    }
+
+    @PostMapping("/remote-upload")
+    public JSendDto remoteUploadFile(HttpSession session, @RequestBody RemoteUploadDto remoteUploadDto, BindingResult bindingResult) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+        int userId = (int) session.getAttribute("userId");
+        if (userId != 1) {
+            return JSendDto.fail("You must be admin to access this feature.");
+        }
+
+        String method = remoteUploadDto.httpMethod();
+        String remoteUrl = remoteUploadDto.url();
+
+        try {
+            Path uploadPath = Paths.get(Constants.UPLOAD_DIR);
+            if (!Files.exists(uploadPath)) {
+                Files.createDirectories(uploadPath);
+            }
+
+            OkHttpClient client = new OkHttpClient();
+            Request request = new Request.Builder()
+                    .url(remoteUrl)
+                    .method(method, null)
+                    .build();
+
+            String fileName = UUID.randomUUID().toString();
+            Path filePath = uploadPath.resolve(fileName);
+
+            Response response = client.newCall(request).execute();
+            if (!response.isSuccessful()) {
+                return JSendDto.error("Failed to request the file");
+            }
+
+            okhttp3.ResponseBody responseBody = response.body();
+            if (responseBody == null) {
+                return JSendDto.error("Failed to download the file");
+            }
+
+            Files.copy(responseBody.byteStream(), filePath, StandardCopyOption.REPLACE_EXISTING);
+
+            FileModel fileModel = new FileModel();
+            fileModel.setFilePath(filePath.toUri().getPath());
+            fileModel.setFileSize((int) responseBody.contentLength());
+            fileModel.setFilename(fileName);
+            fileModel.setUserId(userId);
+            fileService.saveFile(fileModel);
+
+            return JSendDto.success("File uploaded successfully");
+        } catch (Exception e) {
+            return JSendDto.error("An exception occurred while downloading the file");
+        }
+    }
+
+}./controller/AuthController.java
+package com.challenge.drive.controller;
+
+import com.challenge.drive.config.Constants;
+import com.challenge.drive.dto.*;
+import com.challenge.drive.model.UserModel;
+import com.challenge.drive.service.UserService;
+import com.challenge.drive.util.ResetPasswordStorage;
+import com.challenge.drive.util.ResetPasswordToken;
+import jakarta.servlet.http.HttpSession;
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.support.DefaultMessageSourceResolvable;
+import org.springframework.validation.BindingResult;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+
+    private static final Logger logger = LoggerFactory.getLogger(AuthController.class);
+
+    @Autowired
+    private UserService userService;
+
+    @PostMapping("/login")
+    public JSendDto login(@Valid @RequestBody LoginDto loginDto, BindingResult bindingResult, HttpSession session) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+
+        String username = loginDto.username();
+        String password = loginDto.password();
+
+        UserModel user = userService.findByUsernameAndPassword(username, password);
+        if (user == null) {
+            return JSendDto.fail("Invalid username or password");
+        }
+
+        session.setAttribute("userId", user.getId());
+        return JSendDto.success("Login successful");
+    }
+
+    @PostMapping("/register")
+    public JSendDto register(@Valid @RequestBody RegisterDto registerDto, BindingResult bindingResult, HttpSession session) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+
+        String username = registerDto.username();
+        String email = registerDto.email();
+        String password = registerDto.password();
+        String confirmPassword = registerDto.confirmPassword();
+
+        if (!password.equals(confirmPassword)) {
+            return JSendDto.fail("Passwords must match");
+        }
+
+        if (userService.findByUsername(username) != null) {
+            return JSendDto.fail("Username already exists");
+        }
+
+        if (userService.findByEmail(email) != null) {
+            return JSendDto.fail("Email already exists");
+        }
+
+        UserModel user = new UserModel();
+        user.setUsername(username);
+        user.setPassword(password);
+        user.setEmail(email);
+
+        if (userService.saveUser(user) == null) {
+            return JSendDto.fail("Registration failed");
+        }
+
+        session.setAttribute("userId", user.getId());
+        return JSendDto.success("Registration successful");
+    }
+
+    @GetMapping("/logout")
+    public JSendDto logout(HttpSession session) {
+        session.removeAttribute("userId");
+        return JSendDto.success("Logout successful");
+    }
+
+    @GetMapping("/email")
+    public JSendDto viewEmail() {
+        // FAKE EMAIL SERVICE
+        ArrayList<String> emailContent = new ArrayList<>();
+        Path path = Paths.get(Constants.EMAIL_PATH);
+
+        if (Files.exists(path)) {
+            try {
+                emailContent = (ArrayList<String>) Files.readAllLines(path);
+            } catch (IOException e) {
+                logger.error(e.toString());
+            }
+        }
+
+        return JSendDto.success(emailContent);
+    }
+
+    @PostMapping("/send-password-reset")
+    public JSendDto sendPasswordResetEmail(@Valid @RequestBody SendResetPasswordDto sendResetPasswordDto, BindingResult bindingResult) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+
+        String email = sendResetPasswordDto.email();
+
+        UserModel user = userService.findByEmail(email);
+        if (user == null) {
+            return JSendDto.fail("User not found");
+        }
+
+        ResetPasswordToken token = ResetPasswordStorage.getInstance().createResetPasswordToken(user);
+
+        // FAKE EMAIL SERVICE
+        if (!user.getUsername().equals("admin")) {
+            try (FileWriter fw = new FileWriter(Constants.EMAIL_PATH, true)) {
+                fw.write(token.toString() + "\n");
+            } catch (IOException e) {
+                logger.error(e.toString());
+            }
+        }
+
+        return JSendDto.success("Password reset email sent");
+    }
+
+    @PostMapping("/reset-password")
+    public JSendDto resetPassword(@Valid @RequestBody ResetPasswordDto resetPasswordDto, BindingResult bindingResult) {
+        if (bindingResult.hasErrors()) {
+            String errorMessage = bindingResult.getAllErrors().stream()
+                    .map(DefaultMessageSourceResolvable::getDefaultMessage)
+                    .collect(Collectors.joining(", "));
+            return JSendDto.fail("Validation failed: " + errorMessage);
+        }
+
+        String email = resetPasswordDto.email();
+        String token = resetPasswordDto.token();
+        String password = resetPasswordDto.password();
+
+        int userId = ResetPasswordStorage.getInstance().getUserFromResetPasswordToken(
+                email,
+                token
+        );
+        UserModel user = userService.findUserById(userId);
+        if (user == null) {
+            return JSendDto.fail("Wrong email or token.");
+        }
+
+        user.setPassword(password);
+        if (userService.saveUser(user) == null) {
+            return JSendDto.fail("Password reset failed");
+        }
+
+        return JSendDto.success("Password reset successful");
+    }
+
+}
+./filter/CorsFilter.java
+package com.challenge.drive.filter;
+
+import jakarta.servlet.*;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class CorsFilter implements Filter {
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) throws IOException, ServletException {
+
+        HttpServletRequest request = (HttpServletRequest) req;
+        HttpServletResponse response = (HttpServletResponse) res;
+
+        response.setHeader("Access-Control-Allow-Origin", request.getHeader("Origin"));
+        response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        response.setHeader("Access-Control-Allow-Headers", "content-type,x-requested-with");
+        response.setHeader("Access-Control-Allow-Credentials", "true");
+
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            response.setStatus(HttpServletResponse.SC_OK);
+            return;
+        }
+
+        chain.doFilter(req, res);
+    }
+}
+./filter/AuthenticationFilter.java
+package com.challenge.drive.filter;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.challenge.drive.dto.JSendDto;
+import com.challenge.drive.service.UserService;
+import jakarta.servlet.*;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+
+@Component
+public class AuthenticationFilter implements Filter {
+
+    private static final Logger logger = LoggerFactory.getLogger(AuthenticationFilter.class);
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    @Autowired
+    private UserService userService;
+
+    @Override
+    public void init(FilterConfig filterConfig) throws ServletException {
+        Filter.super.init(filterConfig);
+    }
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+
+        HttpSession session = httpRequest.getSession();
+        if (session != null) {
+            Integer userId = (Integer) session.getAttribute("userId");
+            if (userId != null && userService.findUserById((int)userId) != null) {
+                chain.doFilter(request, response);
+                return;
+            }
+        }
+
+        httpResponse.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        httpResponse.setContentType("application/json");
+        JSendDto failResponse = JSendDto.fail("Not logged in");
+        httpResponse.getWriter().write(objectMapper.writeValueAsString(failResponse));
+    }
+
+    @Override
+    public void destroy() {
+        Filter.super.destroy();
+    }
+}
+./config/DataInitializer.java
+package com.challenge.drive.config;
+
+import com.challenge.drive.model.UserModel;
+import com.challenge.drive.repository.UserRepository;
+import com.challenge.drive.util.CryptoUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class DataInitializer {
+
+    private static final Logger logger = LoggerFactory.getLogger(DataInitializer.class);
+
+    @Bean
+    CommandLineRunner initDatabase(UserRepository userRepository) {
+        return args -> {
+            if (userRepository.findByUsername("admin") == null) {
+                UserModel adminUser = new UserModel();
+                // adminUser.setId(1);
+                adminUser.setUsername("admin");
+                adminUser.setEmail("admin@example.com");
+                adminUser.setPassword(CryptoUtils.generateRandomHex());
+                userRepository.save(adminUser);
+                logger.info("Admin user created!");
+            } else {
+                logger.info("Admin user already created!");
+            }
+        };
+    }
+}
+./config/HttpSessionConfig.java
+package com.challenge.drive.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.session.jdbc.config.annotation.web.http.EnableJdbcHttpSession;
+
+@Configuration
+@EnableJdbcHttpSession
+public class HttpSessionConfig {
+}
+./config/FilterConfig.java
+package com.challenge.drive.config;
+
+import com.challenge.drive.filter.AuthenticationFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class FilterConfig {
+
+    @Autowired
+    private AuthenticationFilter authenticationFilter;
+
+    @Bean
+    public FilterRegistrationBean<AuthenticationFilter> filterRegistrationBean() {
+        FilterRegistrationBean<AuthenticationFilter> registrationBean = new FilterRegistrationBean<>();
+        registrationBean.setFilter(authenticationFilter);
+        registrationBean.addUrlPatterns("/user/*");
+        registrationBean.addUrlPatterns("/file/*");
+        return registrationBean;
+    }
+
+}
+./config/Constants.java
+package com.challenge.drive.config;
+
+public class Constants {
+    public static final String EMAIL_PATH = "/tmp/emails.txt";
+    public static final String UPLOAD_DIR = "uploads/";
+}
